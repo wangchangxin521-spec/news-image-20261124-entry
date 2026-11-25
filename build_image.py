@@ -1,235 +1,325 @@
 #!/usr/bin/env python3
-"""Build entry.png: a 1024x1024 front-page image summing up the world news
-of Tuesday 24 November 2026.
+"""Compose the 24 November 2026 one-image front page.
 
-Layout (all pixels, canvas 1024x1024):
-  - navy masthead with the date "TUESDAY, 24 NOVEMBER 2026"
-  - row 1: two wide panels (Gaza strike, Zaporizhzhia strike)
-  - row 2: three panels (India-Nepal aid, landmine toll, Nvidia CEO)
-  - footer line naming the news sources
+Reads the five text-free panel pictures from ``panels/`` next to this file,
+lays them out as a newspaper front page (masthead, two wide stories on top,
+three stories below, source line at the bottom) and writes ``entry.png``
+beside this file.
 
-Each panel is an AI-generated news-style photo (no text in it) on top and
-a navy text block below it with a kicker, a short headline and one
-description line. All text is drawn here with PIL; the panel photos carry
-no text of their own.
-
-Run:  python3 build_image.py
-Writes: entry.png next to this script (PNG if it fits the 1 MiB cap,
-otherwise JPEG bytes under the same entry.png name, which the rules allow).
+Run it from anywhere; it always resolves paths relative to this file.
+Re-running it reproduces the same picture.
 """
 
+from __future__ import annotations
+
 import os
-import sys
+from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-PANELS = os.path.join(HERE, "panels")
-OUT_PATH = os.path.join(HERE, "entry.png")
+HERE = Path(__file__).resolve().parent
+PANELS_DIR = HERE / "panels"
+OUT_PATH = HERE / "entry.png"
 
-W = H = 1024
-MARGIN = 12
-GAP = 12
-HEADER_H = 118
-ROW_H = 400
-FOOTER_H = 46
-MAX_BYTES = 1_048_576
+DEJAVU = "/usr/share/fonts/truetype/dejavu"
+BOLD_FACE = os.path.join(DEJAVU, "DejaVuSans-Bold.ttf")
+PLAIN_FACE = os.path.join(DEJAVU, "DejaVuSans.ttf")
 
-PAPER = (245, 241, 230)      # warm newspaper cream
-NAVY = (14, 34, 51)          # masthead / text-block navy
-NAVY_TEXT = (18, 40, 61)     # slightly lighter navy for text blocks
-RED = (178, 34, 34)          # accent red
-GOLD = (232, 182, 76)        # kicker gold on navy
+# --- page furniture -------------------------------------------------------
+PAGE = 1024                 # square page, pixels
+EDGE = 12                   # cream border around everything
+PHOTO_H = 233               # height of every picture strip
+CAPTION_H = 167             # height of every navy text block
+TEXT_PAD = 18               # text inset inside a caption block
+# A line whose ink runs a hair past the text box is still fine: the side
+# bearings of the face eat a few pixels, so the fit check below allows
+# this much slack before it starts shrinking type.
+BEARING_SLACK = 6
+
+PAPER = (245, 241, 230)     # warm off-white page background
+TOP_NAVY = (14, 34, 51)     # masthead band
+CARD_NAVY = (18, 40, 61)    # story caption blocks
+RULE_RED = (178, 34, 34)    # thin rule under the masthead
+GOLD = (232, 182, 76)       # kickers and the small masthead line
 WHITE = (255, 255, 255)
-DESC_GREY = (215, 222, 232)
+FOOT_GREY = (60, 60, 60)
 
-FONT_BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-FONT_REG = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+DATE_LINE = "TUESDAY, 24 NOVEMBER 2026"
+PAPER_NAME = "THE WORLD IN ONE IMAGE"
+PAPER_SUB = "FIVE STORIES FROM AROUND THE WORLD"
+SOURCE_LINE = "Sources: Reuters · SCMP · AP · ICBL · CNA — 24 November 2026"
+
+# (picture file, focus point, kicker, headline lines, blurb lines)
+# The focus point is where the crop window sits inside the source picture,
+# as a fraction of the spare room: 0.5 is dead centre. Gaza is framed low
+# to keep the street and the walking group; the rest sit near the middle.
+TOP_STORIES = [
+    (
+        "gaza.webp",
+        (0.5, 0.717),
+        "MIDDLE EAST · GAZA",
+        ["HAMAS SECURITY CHIEF", "KILLED IN GAZA STRIKE"],
+        ["Naeem Abu Nahal among at least six killed,", "medics say"],
+    ),
+    (
+        "zaporizhzhia.webp",
+        (0.5, 0.501),
+        "RUSSIA · UKRAINE",
+        ["DEADLY OVERNIGHT STRIKE", "HITS ZAPORIZHZHIA"],
+        ["2 killed, 40 wounded, incl. 4 children, in", "apartment hit"],
+    ),
+]
+BOTTOM_STORIES = [
+    (
+        "nepal.webp",
+        (0.474, 0.5),
+        "SOUTH ASIA",
+        ["INDIA GIVES NEPAL", "$1.62BN FLOOD AID"],
+        ["Biggest aid package ever for", "Nepal after August floods"],
+    ),
+    (
+        "landmines.webp",
+        (0.481, 0.5),
+        "HUMANITARIAN",
+        ["LANDMINE TOLL", "HITS FIVE-YEAR HIGH"],
+        ["6,929 killed or hurt in 2025;", "Myanmar worst, then Syria"],
+    ),
+    (
+        "nvidia.webp",
+        (0.481, 0.5),
+        "TECH",
+        ["NVIDIA BRINGS BACK", "JENSEN HUANG"],
+        ["CEO reinstated less than two", "weeks after resigning"],
+    ),
+]
+
+# Column x positions, measured off the finished page.
+TOP_X = (12, 518)
+TOP_W = 494
+BOTTOM_X = (12, 349, 687)
+BOTTOM_W = 325
+
+# Cap-top y positions inside each caption block, relative to the block top.
+# (kicker, first headline line, first blurb line). The gaps between a
+# block's own lines grow with the type that was actually fitted: a headline
+# line sits its size + 6 below the previous one, a blurb line size + 5.
+TOP_TEXT = (15, 44, 111)
+BOTTOM_TEXT = (15, 43, 115)
 
 
-def font(path, size):
-    try:
-        return ImageFont.truetype(path, size)
-    except OSError:
-        return ImageFont.load_default()
+class TypeDrawer:
+    """Hands out fonts and draws lines aligned by their ink top.
+
+    Pillow draws from the ascender box, which sits a little above the cap
+    height, so every helper here lines text up by the top of its actual
+    ink instead. That keeps cap-tops exactly where the layout says they go,
+    whatever the face's ascent is.
+    """
+
+    def __init__(self, canvas: ImageDraw.ImageDraw) -> None:
+        self.canvas = canvas
+        self._cache: dict[tuple[str, int], ImageFont.FreeTypeFont] = {}
+
+    def font(self, face: str, size: int) -> ImageFont.FreeTypeFont:
+        key = (face, size)
+        if key not in self._cache:
+            self._cache[key] = ImageFont.truetype(face, size)
+        return self._cache[key]
+
+    def ink_box(self, text: str, face: str, size: int) -> tuple[int, int, int, int]:
+        return self.canvas.textbbox(
+            (0, 0), text, font=self.font(face, size), anchor="la"
+        )
+
+    def ink_width(self, text: str, face: str, size: int) -> int:
+        box = self.ink_box(text, face, size)
+        return box[2] - box[0]
+
+    def draw_at_ink_top(
+        self, x: int, cap_top: int, text: str, face: str, size: int, fill: tuple[int, int, int]
+    ) -> None:
+        """Draw ``text`` so its left ink edge is ``x`` and its cap top is ``cap_top``."""
+        box = self.ink_box(text, face, size)
+        self.canvas.text(
+            (x - box[0], cap_top - box[1]),
+            text,
+            font=self.font(face, size),
+            fill=fill,
+            anchor="la",
+        )
+
+    def draw_right_aligned(
+        self, right: int, cap_top: int, text: str, face: str, size: int, fill: tuple[int, int, int]
+    ) -> None:
+        """Draw ``text`` so its right ink edge lands on ``right``."""
+        box = self.ink_box(text, face, size)
+        self.canvas.text(
+            (right - box[2], cap_top - box[1]),
+            text,
+            font=self.font(face, size),
+            fill=fill,
+            anchor="la",
+        )
+
+    def draw_centred(
+        self, centre: int, cap_top: int, text: str, face: str, size: int, fill: tuple[int, int, int]
+    ) -> None:
+        """Draw ``text`` centred on ``centre`` by its ink width."""
+        box = self.ink_box(text, face, size)
+        width = box[2] - box[0]
+        self.canvas.text(
+            (centre - width // 2 - box[0], cap_top - box[1]),
+            text,
+            font=self.font(face, size),
+            fill=fill,
+            anchor="la",
+        )
 
 
-def wrap(draw, text, fnt, max_width):
-    """Greedy word wrap; returns a list of lines that fit max_width."""
-    lines = []
-    for raw in text.split("\n"):
-        words = raw.split()
-        if not words:
-            lines.append("")
-            continue
-        cur = words[0]
-        for word in words[1:]:
-            trial = cur + " " + word
-            if draw.textlength(trial, font=fnt) <= max_width:
-                cur = trial
-            else:
-                lines.append(cur)
-                cur = word
-        lines.append(cur)
-    return lines
+def shrink_until_fits(
+    typer: TypeDrawer,
+    lines: list[str],
+    face: str,
+    start_size: int,
+    max_width: int,
+    floor_size: int = 12,
+) -> int:
+    """Largest size at which every line's ink fits inside ``max_width``.
 
-
-def fit_crop(img, target_w, target_h, focus_y=0.5):
-    """Crop + resize to exactly target_w x target_h, keeping the vertical
-    focus point (0.0 = top of frame, 1.0 = bottom) inside the crop."""
-    src_w, src_h = img.size
-    scale = max(target_w / src_w, target_h / src_h)
-    new_w = max(target_w, round(src_w * scale))
-    new_h = max(target_h, round(src_h * scale))
-    img = img.resize((new_w, new_h), Image.LANCZOS)
-    x0 = (new_w - target_w) // 2
-    focus_px = int(new_h * focus_y)
-    y0 = focus_px - int(target_h * focus_y)
-    y0 = max(0, min(new_h - target_h, y0))
-    return img.crop((x0, y0, x0 + target_w, y0 + target_h))
-
-
-def fit_text(draw, text, path, size, max_width, max_lines=2, min_size=15):
-    """Shrink the font until the wrapped text fits in max_lines lines.
-    Returns (font, lines). Never silently drops words."""
-    while size > min_size:
-        fnt = font(path, size)
-        lines = wrap(draw, text, fnt, max_width)
-        if len(lines) <= max_lines:
-            return fnt, lines
+    Steps down one point at a time from ``start_size``. Never goes below
+    ``floor_size``; a line that still overflows there is drawn anyway rather
+    than crashing the build, so a long headline can never silently vanish.
+    """
+    size = start_size
+    while size > floor_size and any(
+        typer.ink_width(line, face, size) > max_width for line in lines
+    ):
         size -= 1
-    fnt = font(path, min_size)
-    return fnt, wrap(draw, text, fnt, max_width)
+    return size
 
 
-def fit_single_line(draw, text, path, size, max_width, min_size=20):
-    """Shrink the font until the text fits on one line within max_width."""
-    while size > min_size:
-        fnt = font(path, size)
-        if draw.textlength(text, font=fnt) <= max_width:
-            return fnt
-        size -= 1
-    return font(path, min_size)
+def cover_crop(
+    picture: Image.Image, width: int, height: int, focus: tuple[float, float]
+) -> Image.Image:
+    """Crop ``picture`` to the ``width`` x ``height`` aspect around ``focus``.
+
+    ``focus`` is (horizontal, vertical), each 0..1 across the spare room
+    left after the crop; 0.5 in both directions is a dead-centre crop.
+    """
+    target = width / height
+    src_w, src_h = picture.size
+    if src_w / src_h > target:
+        # Too wide: trim the sides, keep the full height.
+        keep_w = int(src_h * target)
+        left = round((src_w - keep_w) * focus[0])
+        picture = picture.crop((left, 0, left + keep_w, src_h))
+    else:
+        # Too tall: trim top and bottom, keep the full width.
+        keep_h = int(src_w / target)
+        top = round((src_h - keep_h) * focus[1])
+        picture = picture.crop((0, top, src_w, top + keep_h))
+    return picture.resize((width, height), Image.LANCZOS)
 
 
-def draw_panel(canvas, x, y, w, h, image, kicker, headline, desc,
-               headline_size, desc_size):
-    """One news panel: photo on top, navy text block below."""
-    img_h = 232
-    text_h = h - img_h
-    canvas.paste(image, (x, y))
-    tx, ty = x, y + img_h
-    d = ImageDraw.Draw(canvas)
-    d.rectangle([tx, ty, tx + w, ty + text_h], fill=NAVY_TEXT)
-    d.rectangle([tx, ty, tx + w, ty + text_h], outline=(255, 255, 255),
-                width=1)
-    pad = 16 if w > 400 else 14
-    inner = w - 2 * pad
-    # kicker
-    kf = font(FONT_BOLD, 19)
-    d.text((tx + pad, ty + 12), kicker, font=kf, fill=GOLD)
-    # headline (auto-shrunk so every word fits in 2 lines)
-    hf, lines = fit_text(d, headline, FONT_BOLD, headline_size, inner)
-    hy = ty + 38
-    for line in lines:
-        d.text((tx + pad, hy), line, font=hf, fill=WHITE)
-        hy += hf.size + 6
-    # description (auto-shrunk so every word fits in 2 lines)
-    df, dlines = fit_text(d, desc, FONT_REG, desc_size, inner)
-    dy = ty + text_h - 8 - len(dlines) * (df.size + 5)
-    for line in dlines:
-        d.text((tx + pad, dy), line, font=df, fill=DESC_GREY)
-        dy += df.size + 5
+def paint_masthead(page: Image.Image, typer: TypeDrawer) -> None:
+    draw = ImageDraw.Draw(page)
+    draw.rectangle([EDGE, EDGE, PAGE - EDGE, EDGE + 111], fill=TOP_NAVY)
+    draw.rectangle([EDGE, EDGE + 112, PAGE - EDGE, EDGE + 118], fill=RULE_RED)
+    typer.draw_at_ink_top(EDGE + 25, EDGE + 15, PAPER_NAME, BOLD_FACE, 22, GOLD)
+    typer.draw_right_aligned(
+        PAGE - EDGE - 27, EDGE + 19, PAPER_SUB, PLAIN_FACE, 21, WHITE
+    )
+    typer.draw_at_ink_top(EDGE + 25, EDGE + 44, DATE_LINE, BOLD_FACE, 56, WHITE)
 
 
-def main():
-    canvas = Image.new("RGB", (W, H), PAPER)
-    d = ImageDraw.Draw(canvas)
+def paint_card(
+    page: Image.Image,
+    typer: TypeDrawer,
+    story: tuple[str, tuple[float, float], str, list[str], list[str]],
+    x: int,
+    photo_y: int,
+    width: int,
+    text_spec: tuple[int, int, int],
+    headline_size: int,
+    blurb_size: int,
+) -> None:
+    """One picture plus its navy caption block underneath."""
+    picture_file, focus, kicker, headline, blurb = story
+    caption_y = photo_y + PHOTO_H
 
-    # ---- masthead ------------------------------------------------------
-    d.rectangle([MARGIN, MARGIN, W - MARGIN, MARGIN + HEADER_H], fill=NAVY)
-    d.rectangle([MARGIN, MARGIN + HEADER_H - 6, W - MARGIN,
-                 MARGIN + HEADER_H], fill=RED)
-    kick = font(FONT_BOLD, 22)
-    d.text((MARGIN + 24, MARGIN + 10), "THE WORLD IN ONE IMAGE",
-           font=kick, fill=GOLD)
-    date_f = fit_single_line(d, "TUESDAY, 24 NOVEMBER 2026", FONT_BOLD, 66,
-                             W - 2 * MARGIN - 48, min_size=36)
-    d.text((MARGIN + 24, MARGIN + 34), "TUESDAY, 24 NOVEMBER 2026",
-           font=date_f, fill=WHITE)
-    sub_f = font(FONT_REG, 22)
-    sub = "FIVE STORIES FROM AROUND THE WORLD"
-    sw = d.textlength(sub, font=sub_f)
-    d.text((W - MARGIN - 24 - sw, MARGIN + 14), sub, font=sub_f,
-           fill=DESC_GREY)
+    with Image.open(PANELS_DIR / picture_file) as shot:
+        page.paste(
+            cover_crop(shot.convert("RGB"), width, PHOTO_H, focus), (x, photo_y)
+        )
 
-    # ---- panels --------------------------------------------------------
-    row1_y = MARGIN + HEADER_H + GAP
-    row2_y = row1_y + ROW_H + GAP
-    row1_w = (W - 2 * MARGIN - GAP) // 2            # 494
-    row2_w = (W - 2 * MARGIN - 2 * GAP) // 3        # 325
+    draw = ImageDraw.Draw(page)
+    # A one-pixel white mat shows around the navy block on every side:
+    # white slab first, navy slab inset by one pixel on top of it.
+    draw.rectangle(
+        [x, caption_y - 1, x + width, caption_y + CAPTION_H], fill=WHITE
+    )
+    draw.rectangle(
+        [x + 1, caption_y, x + width - 1, caption_y + CAPTION_H - 1], fill=CARD_NAVY
+    )
 
-    def load(name):
-        path = os.path.join(PANELS, name)
-        if not os.path.exists(path):
-            sys.exit("missing panel image: " + path)
-        return Image.open(path).convert("RGB")
+    text_x = x + TEXT_PAD
+    inner_w = width - 2 * TEXT_PAD + BEARING_SLACK
+    kick_top, head_top, blurb_top = text_spec
 
-    gaza = fit_crop(load("gaza.webp"), row1_w, 232, focus_y=0.72)
-    zap = fit_crop(load("zaporizhzhia.webp"), row1_w, 232, focus_y=0.5)
-    nepal = fit_crop(load("nepal.webp"), row2_w, 232, focus_y=0.5)
-    mines = fit_crop(load("landmines.webp"), row2_w, 232, focus_y=0.5)
-    nvidia = fit_crop(load("nvidia.webp"), row2_w, 232, focus_y=0.5)
+    kicker_size = shrink_until_fits(typer, [kicker], BOLD_FACE, 19, inner_w)
+    typer.draw_at_ink_top(
+        text_x, caption_y + kick_top, kicker, BOLD_FACE, kicker_size, GOLD
+    )
 
-    draw_panel(canvas, MARGIN, row1_y, row1_w, ROW_H, gaza,
-               "MIDDLE EAST \u00b7 GAZA",
-               "HAMAS SECURITY CHIEF KILLED IN GAZA STRIKE",
-               "Naeem Abu Nahal among at least six killed, medics say",
-               33, 21)
-    draw_panel(canvas, MARGIN + row1_w + GAP, row1_y, row1_w, ROW_H, zap,
-               "RUSSIA \u00b7 UKRAINE",
-               "DEADLY OVERNIGHT STRIKE HITS ZAPORIZHZHIA",
-               "2 killed, 40 wounded, incl. 4 children, in apartment hit",
-               33, 21)
-    draw_panel(canvas, MARGIN, row2_y, row2_w, ROW_H, nepal,
-               "SOUTH ASIA",
-               "INDIA GIVES NEPAL $1.62BN FLOOD AID",
-               "Biggest aid package ever for Nepal after August floods",
-               26, 19)
-    draw_panel(canvas, MARGIN + row2_w + GAP, row2_y, row2_w + 1, ROW_H,
-               mines,
-               "HUMANITARIAN",
-               "LANDMINE TOLL HITS FIVE-YEAR HIGH",
-               "6,929 killed or hurt in 2025; Myanmar worst, then Syria",
-               26, 19)
-    draw_panel(canvas, W - MARGIN - row2_w, row2_y, row2_w, ROW_H, nvidia,
-               "TECH",
-               "NVIDIA BRINGS BACK JENSEN HUANG",
-               "CEO reinstated less than two weeks after resigning",
-               26, 19)
+    head_size = shrink_until_fits(typer, headline, BOLD_FACE, headline_size, inner_w)
+    head_step = head_size + 6
+    for i, line in enumerate(headline):
+        typer.draw_at_ink_top(
+            text_x,
+            caption_y + head_top + i * head_step,
+            line,
+            BOLD_FACE,
+            head_size,
+            WHITE,
+        )
 
-    # ---- footer --------------------------------------------------------
-    foot = font(FONT_REG, 17)
-    src = ("Sources: Reuters \u00b7 SCMP \u00b7 AP \u00b7 ICBL \u00b7 CNA  "
-           "\u2014  24 November 2026")
-    fw = d.textlength(src, font=foot)
-    d.text(((W - fw) / 2, H - MARGIN - 30), src, font=foot, fill=(60, 60, 60))
+    blurb_size = shrink_until_fits(typer, blurb, PLAIN_FACE, blurb_size, inner_w)
+    blurb_step = blurb_size + 5
+    for i, line in enumerate(blurb):
+        typer.draw_at_ink_top(
+            text_x,
+            caption_y + blurb_top + i * blurb_step,
+            line,
+            PLAIN_FACE,
+            blurb_size,
+            WHITE,
+        )
 
-    # ---- save: PNG if it fits, else JPEG bytes under the same name -----
-    canvas.save(OUT_PATH, "PNG", optimize=True)
-    size = os.path.getsize(OUT_PATH)
-    fmt = "PNG"
-    if size > MAX_BYTES:
-        for quality in (90, 85, 80, 75):
-            canvas.save(OUT_PATH, "JPEG", quality=quality, optimize=True)
-            size = os.path.getsize(OUT_PATH)
-            fmt = "JPEG q%d" % quality
-            if size <= MAX_BYTES:
-                break
-    print("wrote %s (%s, %d bytes, %dx%d)"
-          % (OUT_PATH, fmt, size, W, H))
-    if size > MAX_BYTES:
-        sys.exit("entry.png still over the 1 MiB cap")
+
+def build_page() -> Image.Image:
+    page = Image.new("RGB", (PAGE, PAGE), PAPER)
+    typer = TypeDrawer(ImageDraw.Draw(page))
+
+    paint_masthead(page, typer)
+
+    photo_top = EDGE + 130
+    for story, x in zip(TOP_STORIES, TOP_X):
+        paint_card(page, typer, story, x, photo_top, TOP_W, TOP_TEXT, 33, 21)
+
+    photo_bottom = photo_top + PHOTO_H + CAPTION_H + 12
+    for story, x in zip(BOTTOM_STORIES, BOTTOM_X):
+        paint_card(page, typer, story, x, photo_bottom, BOTTOM_W, BOTTOM_TEXT, 26, 19)
+
+    foot_size = shrink_until_fits(
+        typer, [SOURCE_LINE], PLAIN_FACE, 17, PAGE - 2 * EDGE
+    )
+    typer.draw_centred(PAGE // 2, PAGE - 39, SOURCE_LINE, PLAIN_FACE, foot_size, FOOT_GREY)
+    return page
+
+
+def main() -> None:
+    build_page().save(OUT_PATH)
+    print(f"wrote {OUT_PATH} ({OUT_PATH.stat().st_size} bytes)")
 
 
 if __name__ == "__main__":
